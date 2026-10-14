@@ -2243,6 +2243,14 @@ public static class BlueprintDecompilerUtils
 
         string FormatOperand(FRigVMOperand operand) => storage.FormatOperand(operand);
 
+        // InvokeCallable addresses a callable by its Index, which is normally its position in the table.
+        FRigVMCallableInfo? FindCallable(int callableIndex) =>
+            byteCode.CallableInfos.FirstOrDefault(callable => callable.Index == callableIndex)
+            ?? (callableIndex < byteCode.CallableInfos.Length ? byteCode.CallableInfos[callableIndex] : null);
+
+        // Callables are named by object path ("/Game/...FNC_C:DeformRig_Elbow_FNC"); the function is the part after the colon.
+        static string CallableShortName(FRigVMCallableInfo callable) => callable.Name.Text.SubstringAfterLast(':');
+
         var stringBuilder = new CustomStringBuilder();
         stringBuilder.AppendLine("// Decompiled ControlRig graph (RigVM bytecode, UE 4.25+).");
         stringBuilder.AppendLine("// Registers are named <Node>.<Pin>; each Execute() runs one rig unit, cross-node arguments show");
@@ -2468,6 +2476,32 @@ public static class BlueprintDecompilerUtils
                 case FRigVMJumpToBranchOp branchOp:
                     stringBuilder.AppendLine($"// JumpToBranch on {FormatOperand(branchOp.Arg)} (branch table from {branchOp.FirstBranchInfoIndex})");
                     break;
+                case FRigVMInvokeCallableOp invokeOp:
+                {
+                    // The operands line up with the callable's own argument list, so each one is labelled with
+                    // the parameter it binds to. A literal operand is an authored constant on the call node.
+                    var callable = FindCallable(invokeOp.CallableIndex);
+                    var callArguments = new List<(string Text, string? Pin)>();
+                    for (var argumentIndex = 0; argumentIndex < invokeOp.Arguments.Length; argumentIndex++)
+                    {
+                        var argument = invokeOp.Arguments[argumentIndex];
+                        var parameter = callable is not null && argumentIndex < callable.Arguments.Length
+                            ? callable.Arguments[argumentIndex].Name.Text
+                            : null;
+                        var text = argument.MemoryType == ERigVMMemoryType.Literal
+                            ? storage.FormatLiteralValue(argument, parameter)
+                            : FormatOperand(argument);
+                        callArguments.Add((text, parameter));
+                        writtenRegisters.Add((argument.MemoryType, argument.RegisterIndex));
+                    }
+
+                    var callableName = callable is not null ? CallableShortName(callable) : $"Callable_{invokeOp.CallableIndex}";
+                    stringBuilder.AppendLine($"// [{step}] call {callableName}");
+                    AppendCall(stringBuilder, callableName, callArguments, isMethod: false);
+                    stringBuilder.AppendLine();
+                    step++;
+                    break;
+                }
                 case FRigVMTernaryOp ternaryOp:
                     stringBuilder.AppendLine($"// {ternaryOp.OpCode}({FormatOperand(ternaryOp.ArgA)}, {FormatOperand(ternaryOp.ArgB)}, {FormatOperand(ternaryOp.ArgC)})");
                     break;
@@ -2480,13 +2514,35 @@ public static class BlueprintDecompilerUtils
             }
         }
 
+        // Instructions owned by a callable are its body, not part of the event that happens to precede it in
+        // the stream; they are written out below as functions of their own.
+        bool IsInCallable(int index) => byteCode.CallableInfos.Any(callable => index >= callable.FirstInstruction && index <= callable.LastInstruction);
+
         for (var index = 0; index < byteCode.Instructions.Count; index++)
         {
-            if (lazyBlockInstructions.Contains(index)) continue;
+            if (lazyBlockInstructions.Contains(index) || IsInCallable(index)) continue;
             EmitInstruction(index);
         }
 
         stringBuilder.CloseBlock();
+
+        foreach (var callable in byteCode.CallableInfos)
+        {
+            var parameters = callable.Arguments.Select(argument =>
+                $"{(argument.Direction == ERigVMPinDirection.Input ? "" : argument.Direction == ERigVMPinDirection.Output ? "out " : "inout ")}{argument.TypeString} {argument.Name.Text}");
+
+            stringBuilder.AppendLine();
+            stringBuilder.AppendLine($"// {callable.Name.Text}");
+            stringBuilder.AppendLine($"void {CallableShortName(callable)}({string.Join(", ", parameters)})");
+            stringBuilder.OpenBlock();
+            for (var index = callable.FirstInstruction; index <= callable.LastInstruction && index < byteCode.Instructions.Count; index++)
+            {
+                if (lazyBlockInstructions.Contains(index)) continue;
+                EmitInstruction(index);
+            }
+            stringBuilder.CloseBlock();
+        }
+
         return stringBuilder.ToString();
     }
 
@@ -2495,18 +2551,20 @@ public static class BlueprintDecompilerUtils
     /// argument then gets its own line tagged with the pin it feeds, which is the only place that mapping is
     /// recorded - the bytecode itself only carries position.
     /// </summary>
-    private static void AppendCall(CustomStringBuilder stringBuilder, string nodeName, List<(string Text, string? Pin)> arguments)
+    private static void AppendCall(CustomStringBuilder stringBuilder, string nodeName, List<(string Text, string? Pin)> arguments, bool isMethod = true)
     {
         const int singleLineBudget = 110;
 
-        var singleLine = $"{nodeName}.Execute({string.Join(", ", arguments.Select(argument => argument.Text))});";
+        // A rig unit runs through its node's Execute; a callable is a function of the rig and is called by name.
+        var callee = isMethod ? $"{nodeName}.Execute" : nodeName;
+        var singleLine = $"{callee}({string.Join(", ", arguments.Select(argument => argument.Text))});";
         if (arguments.Count <= 1 || singleLine.Length <= singleLineBudget)
         {
             stringBuilder.AppendLine(singleLine);
             return;
         }
 
-        stringBuilder.AppendLine($"{nodeName}.Execute(");
+        stringBuilder.AppendLine($"{callee}(");
         stringBuilder.IncreaseIndentation();
         var labelled = new HashSet<string>();
         for (var i = 0; i < arguments.Count; i++)

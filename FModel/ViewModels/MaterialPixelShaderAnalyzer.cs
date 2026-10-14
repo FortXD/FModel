@@ -38,6 +38,14 @@ public class PixelShaderWiring
     /// <summary>Material output pin name → the serialized values the shader routes into it.</summary>
     public Dictionary<string, List<PixelValueSource>> PinSources { get; } = new();
     /// <summary>
+    /// Whether the analyzed permutation writes the deferred GBuffer. Pin recovery is seeded from
+    /// render-target components, so a forward/translucent permutation (false) only ever yields the
+    /// targets it actually writes - typically Emissive Color and Opacity. Inputs like Base Color
+    /// may still be connected in the material and consumed inline by the forward lighting without
+    /// ever reaching a render target, so their absence here is NOT evidence they are unconnected.
+    /// </summary>
+    public bool? UsesGBuffer;
+    /// <summary>
     /// Material output pin name → annotated D3D SM5 assembly of the instructions whose values
     /// flow into that pin, sliced out of the compiled pixel shader.
     /// </summary>
@@ -133,6 +141,13 @@ public sealed class PixelExpressionNode
     public string Detail = string.Empty;
     /// <summary>For "sample" nodes: node component → texture channel (the resource operand swizzle).</summary>
     public int[] ChannelMap;
+    /// <summary>
+    /// Destination lanes this instruction wrote. When these are not the natural 0..n-1 the node's
+    /// k-th written lane corresponds to the k-th source component, NOT to the lane of the same
+    /// name in the sources - e.g. a dest mask of .xw reading sources .xy means lane w came from
+    /// source component y. Printed as an annotation so a reader cannot assume lane-for-lane.
+    /// </summary>
+    public int[]? Lanes;
 }
 
 /// <summary>
@@ -628,6 +643,7 @@ public static class MaterialPixelShaderAnalyzer
         };
         var (state, discardSink) = RunTaintAnalysis(instructions, context);
 
+        wiring.UsesGBuffer = usesGBuffer;
         MapSinksToPins(state, discardSink, outputRegToTarget, usesGBuffer, wiring);
         try
         {
@@ -1268,6 +1284,7 @@ public static class MaterialPixelShaderAnalyzer
         };
         var (state, discardSink) = RunTaintAnalysis(instructions, context);
 
+        wiring.UsesGBuffer = usesGBuffer;
         MapSinksToPins(state, discardSink, outputRegToTarget, usesGBuffer, wiring);
         try
         {
@@ -2572,17 +2589,30 @@ public static class MaterialPixelShaderAnalyzer
 
         // "xyzw" lane letters ("rgba" through a sample node's channel map); identity prefixes
         // (.x, .xy, .xyz, .xyzw) collapse to nothing like an authored graph's implicit casts
-        static string BuildSwizzle(PixelExpressionNode node, int[] components)
+        // "dest" is the lane positions the value lands in. A source swizzle may only be collapsed
+        // when it reads lane-for-lane into those positions; otherwise the read is a compaction
+        // (e.g. dest lanes .xw reading source .xy) and hiding it invites the reader to assume
+        // lane w came from source component w, which it did not.
+        static string BuildSwizzle(PixelExpressionNode node, int[] components, int[]? dest = null)
         {
             if (node.Op == "cbrow" && node.Source is { Kind: PixelValueKind.ScalarExpression }) return string.Empty;
             if (node.Op == "imm" && (node.Constants?.Length ?? 0) <= 1) return string.Empty;
             if (node.Op is "dp2" or "dp3" or "dp4" or "phi" or "mask") return string.Empty;
-            var letters = node.ChannelMap != null
-                ? string.Concat(components.Select(c => "rgba"[Math.Clamp(node.ChannelMap[Math.Clamp(c, 0, 3)], 0, 3)]))
-                : string.Concat(components.Select(c => "xyzw"[Math.Clamp(c, 0, 3)]));
-            return "xyzw".StartsWith(letters, StringComparison.Ordinal) || "rgba".StartsWith(letters, StringComparison.Ordinal)
-                ? string.Empty
-                : letters;
+            if (node.ChannelMap != null)
+            {
+                // A sample's channel letters are real information: they name which channel of the
+                // texture the compiled instruction reads (after the resource swizzle), which is not
+                // recoverable from anything else in the printed output. Only a full "rgba" read is
+                // redundant - collapsing "r"/"rg"/"rgb" as an identity prefix the way lane swizzles
+                // are collapsed would silently hide a single-channel read of Red.
+                var channels = string.Concat(components.Select(c => "rgba"[Math.Clamp(node.ChannelMap[Math.Clamp(c, 0, 3)], 0, 3)]));
+                return channels == "rgba" ? string.Empty : channels;
+            }
+            var letters = string.Concat(components.Select(c => "xyzw"[Math.Clamp(c, 0, 3)]));
+            var laneForLane = dest != null
+                ? dest.Length == components.Length && !components.Where((c, i) => c != dest[i]).Any()
+                : "xyzw".StartsWith(letters, StringComparison.Ordinal);
+            return laneForLane ? string.Empty : letters;
         }
 
         // resolves one post-swizzle component of a source operand to the node that produces it
@@ -2674,7 +2704,7 @@ public static class MaterialPixelShaderAnalyzer
             if (refs.All(r => ReferenceEquals(r.Node, refs[0].Node)))
             {
                 node = refs[0].Node;
-                swizzle = BuildSwizzle(node, refs.Select(r => r.Component).ToArray());
+                swizzle = BuildSwizzle(node, refs.Select(r => r.Component).ToArray(), components);
             }
             else
             {
@@ -2683,7 +2713,7 @@ public static class MaterialPixelShaderAnalyzer
                     node.Args.Add(new PixelExpressionArg
                     {
                         Node = refs[i].Node,
-                        Swizzle = BuildSwizzle(refs[i].Node, [refs[i].Component]),
+                        Swizzle = BuildSwizzle(refs[i].Node, [refs[i].Component], [i]),
                         Name = i < 4 ? new string("XYZW"[i], 1) : $"In {i}"
                     });
                 swizzle = string.Empty;
@@ -2845,9 +2875,9 @@ public static class MaterialPixelShaderAnalyzer
                 {
                     var destination = instruction.Operands[d];
                     if (destination.Type == 13) continue; // null dest
-                    var node = new PixelExpressionNode { Op = d == 0 ? firstOp : secondOp, Saturate = instruction.Saturate };
                     var lanes = MaskedComponents(destination);
                     if (lanes.Length == 0) continue;
+                    var node = new PixelExpressionNode { Op = d == 0 ? firstOp : secondOp, Saturate = instruction.Saturate, Lanes = lanes };
                     var argNames = ArgNamesFor(node.Op, instruction.Operands.Count - 2);
                     for (var s = 2; s < instruction.Operands.Count; s++)
                         node.Args.Add(MakeArg(instruction.Operands[s], lanes, argNames[s - 2]));
@@ -2860,7 +2890,7 @@ public static class MaterialPixelShaderAnalyzer
                 var destination = instruction.Operands[0];
                 var lanes = MaskedComponents(destination);
                 if (lanes.Length == 0) return;
-                var node = new PixelExpressionNode { Op = mnemonic, Saturate = instruction.Saturate };
+                var node = new PixelExpressionNode { Op = mnemonic, Saturate = instruction.Saturate, Lanes = lanes };
                 var argNames = ArgNamesFor(mnemonic, instruction.Operands.Count - 1);
                 for (var s = 1; s < instruction.Operands.Count; s++)
                     node.Args.Add(MakeArg(instruction.Operands[s], lanes, argNames[s - 1]));

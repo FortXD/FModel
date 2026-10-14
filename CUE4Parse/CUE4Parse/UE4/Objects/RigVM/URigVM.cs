@@ -124,6 +124,15 @@ public class URigVM : Assets.Exports.UObject
             CachedVMHash = Ar.Read<uint>();
         }
 
+        if (Ar.Game >= EGame.GAME_UE6_0)
+        {
+            // Fortnite 42.30 writes one int32 here that neither the UE 5.8 nor the ue5-main RigVM sources serialize.
+            // It has been zero in every cooked rig checked, so what it holds is unknown.
+            var unknown = Ar.Read<int>();
+            if (unknown != 0)
+                Log.Warning("RigVM: unidentified int32 after CachedVMHash is {0}, the rest of the VM may misread", unknown);
+        }
+
         ExternalPropertyPathDescriptions = Ar.ReadArray(() => new FRigVMPropertyPathDescription(Ar));
         FunctionNamesStorage = Ar.ReadArray(Ar.ReadFName);
         ByteCodeStorage = new FRigVMByteCode(Ar);

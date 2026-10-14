@@ -721,6 +721,126 @@ app — confirmed working (real hash → offset/size/frequency entries, matching
   material; not a decompiler gap. Also where the texture-resolution fallback (point 5 above) was
   confirmed firing correctly rather than guessing.
 
+## Bug found and fixed in a later session: texture channel reads of Red printed as nothing
+
+**Symptom.** A sample whose compiled instruction reads the texture's **Red** channel printed with
+no swizzle at all — visually identical to a full RGBA read. A reader then attributes the lane
+letter of whatever arithmetic consumes the sample to the texture instead, e.g.
+
+```
+var _20 = ((T_NoisePack_01 + -0.5).w * 0.2 + _19);
+```
+
+which reads as "alpha channel" but is actually "Red channel, and `.w` is the destination lane of
+the enclosing `add`". Three of the four texture reads in
+`Effects/Fort_Effects/Materials/Melee/M_Melee_Trail_Generic` were mis-attributable this way, and
+two of them (`T_GoingCommando_RingNoise_01`, `T_InTheZone_LightRays_01`) point at textures whose
+**B channel is identically 0 and A identically 255** — so the naive reading makes two whole
+branches of the material look dead when they are not.
+
+**Cause.** `BuildSwizzle` collapsed identity prefixes so scalar lane swizzles (`.x`) do not clutter
+the output. The collapse test was applied to the *channel* letters too:
+
+```csharp
+return "xyzw".StartsWith(letters) || "rgba".StartsWith(letters) ? string.Empty : letters;
+```
+
+`"rgba".StartsWith("r")` is true, so a single-channel Red read was suppressed. `.g`/`.b`/`.a` were
+unaffected, which is why the bug is easy to miss — only Red disappears.
+
+**Fix.** Split the two cases in `BuildSwizzle`. A node with a `ChannelMap` is a texture sample and
+its letters name which channel the compiled instruction actually reads (after the resource
+swizzle) — information recoverable from nothing else in the output — so only a full `rgba` read is
+redundant. Lane swizzles keep the old identity-prefix collapse.
+
+**Verified** against `M_Melee_Trail_Generic` (10.40, `EGame.GAME_UE4_23`), cross-checked against
+the raw DXBC resource swizzles in the same run:
+
+```
+sample_b r0.w, r3.xwxx, t1.yzwx, s1   dest .w -> ch x = R   T_NoisePack_01              now .r
+sample_b r2.w, r4.xzxx, t2.yzwx, s2   dest .w -> ch x = R   T_InTheZone_LightRays_01    now .r
+sample_b r3.y, r3.yzyy, t2.xyzw, s2   dest .y -> ch y = G   T_InTheZone_LightRays_01    still .g
+sample_b r3.z, r6.xyxx, t3.yzxw, s3   dest .z -> ch x = R   T_GoingCommando_RingNoise   now .r
+```
+
+Only other output change is that partial reads of engine-resource samples now print `.rgb`
+(3-component read of a 4-channel sample) where they previously printed nothing — also accurate,
+since it distinguishes "took RGB" from "took all four".
+
+Note this is a *different* situation from the `linear_gradient` finding above. There the compiler
+legitimately substituted `.R` for an authored `.A` on a `TC_Grayscale` texture, and the decompiler
+correctly showed the compiled read. Here the compiled read was correct internally but never
+printed.
+
+### Harness fixes needed to run this
+
+- `ShaderDecompileTest/ShaderDecompileTest.csproj` did not `Compile Include` the later-added
+  `FModel/ViewModels/MaterialShaderLibrary.cs`, so the project failed with
+  `CS0103: The name 'MaterialShaderLibrary' does not exist`. Added.
+- The FULL-disassembly block in `Program.cs` hardcodes `TypeName == "TBasePassPSFNoLightMapPolicy"`,
+  which this material does not compile (it uses
+  `TBasePassPSFSimpleDirectionalLightLightingPolicy`), so that section printed nothing. Relaxed to
+  any `TBasePassPS*`. `Program.cs.bak` holds the original.
+
+### Three further fixes: lane provenance, unrecovered pins, forward Base Color
+
+All three came out of a session where the decompile of `M_Melee_Trail_Generic` was used to rebuild
+the material and the rebuild was wrong in ways the output actively encouraged.
+
+**1. Source swizzles were collapsed, so destination lanes read as source components.**
+`add r3.xw, -v2.xxxy, l(1,0,0,1)` printed as `(-_15 + Const(1,0,0,1).xw)`. The source swizzle
+`.xy` was suppressed because `"xyzw".StartsWith("xy")` — the same identity-prefix collapse as the
+Red-channel bug above. A reader then sees `_19.w` downstream and concludes lane `w` came from
+`v2.w`, i.e. a second UV set that does not exist. (It cost this session an entire invented UV1 and
+every conclusion built on it.)
+
+`BuildSwizzle` now takes the destination lanes and collapses only on a genuine lane-for-lane read.
+Nodes also carry their destination mask and print it when it is not the natural `0..n-1`:
+
+```
+var _19 = (-_15.xy + Const(1, 0, 0, 1));  // writes lanes .xw - k-th lane = k-th source component
+var _20 = ((T_NoisePack_01.r + -0.5) * 0.2 + _19.x);
+```
+
+**2. Pins that were never recovered were simply absent.** Silence reads as "not connected in the
+material", which is a different claim. The listing now ends with an explicit
+`// Not recovered: ...` block naming them, and says why — for a forward/translucent permutation,
+that only the render targets it actually writes are recoverable, and that absence is not evidence
+the input is unconnected. `PixelShaderWiring.UsesGBuffer` was added to drive the wording.
+
+**3. Base Color is now recovered on forward/translucent permutations.** It never reaches a render
+target there, so the GBuffer-seeded pin recovery could not see it. But the base pass applies
+`View.DiffuseOverrideParameter` to `GBuffer.DiffuseColor` (`BasePassPixelShader.usf`, the
+`USE_DEVELOPMENT_SHADERS` block, 4.23 line 973):
+
+```hlsl
+GBuffer.DiffuseColor = GBuffer.DiffuseColor * View.DiffuseOverrideParameter.w + View.DiffuseOverrideParameter.xyz;
+```
+
+`RecoverDiffuseColorPin` finds that `mad` in an already-recovered pin's DAG and exposes its first
+operand — `DiffuseColor = BaseColor * (1 - Metallic)` — as the Base Color pin. The override row is
+looked up **by name** in `EngineUniformBufferLayout`, not hardcoded, since it is row 130 on the
+4.2x table and 126 on the UE4.19 one.
+
+Verified on `M_Melee_Trail_Generic`, which now reports what previously had to be inferred by hand
+from the raw disassembly plus the engine source:
+
+```
+var _0  = TEXCOORD3 (v3);
+var _1  = saturate(_0);
+Base_Color = _1;            // = saturate(ParticleColor.rgb)
+```
+
+Before this, the material read as emissive-only and the lit white body it actually renders was
+unexplainable from the decompile.
+
+### Still missing: MaterialExpressionDynamicParameter
+
+`DynamicParameter` appears nowhere in the decompiler (the only source hit is an unrelated
+`ObjectVersion.cs` comment). Per-particle dynamic parameters arrive as an interpolant and will
+currently print as a bare `v#`/`TEXCOORD#` with no name. Not exercised by
+`M_Melee_Trail_Generic` (no such node in its graph) but `M_Melee_Trail_Master` has one.
+
 ## Known limitations / explicitly out of scope
 
 - ~~**UE 4.25+ preshader bytecode**~~ — now supported for 4.26/4.27, see "UE 4.26 support" below.

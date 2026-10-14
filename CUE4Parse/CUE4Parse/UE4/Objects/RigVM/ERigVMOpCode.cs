@@ -107,6 +107,7 @@ public enum ERigVMOpCode : byte
     Execute, // single execute op (formerly Execute_0_Operands to Execute_64_Operands)
     RunInstructions, // runs a set of instructions lazily
     SetupTraits, // sets up a list of traits on executecontext
+    InvokeCallable, // invokes a callable (a function or an entry) with a list of operands
     Invalid,
     FirstArrayOpCode = ArrayReset,
     LastArrayOpCode = ArrayReverse,

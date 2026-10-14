@@ -11,12 +11,12 @@ using Serilog;
 
 Log.Logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Console().CreateLogger();
 
-const string paksPath = @"V:\.builds\1.10\FortniteGame\Content\Paks";
-const string aesKey = "0x79323938716A53623131354E71513341676164333044576E3251597254493843";
-const string assetPath = "FortniteGame/Content/UI/Foundation/Environment/Shell/Materials/M_UI_Shell_Sphere";
+const string paksPath = @"V:/.builds/10.40/FortniteGame/Content/Paks";
+const string aesKey = "0x3FF229552FE0F0DC46A495F9E94766EB6B5106A136597C60E7132F413B7C016E";
+const string assetPath = "FortniteGame/Content/Effects/Fort_Effects/Materials/Melee/M_Melee_Trail_Generic";
 
 Console.WriteLine($"Mounting {paksPath} ...");
-var provider = new DefaultFileProvider(paksPath, SearchOption.AllDirectories, new VersionContainer(EGame.GAME_UE4_19), StringComparer.OrdinalIgnoreCase)
+var provider = new DefaultFileProvider(paksPath, SearchOption.AllDirectories, new VersionContainer(EGame.GAME_UE4_23), StringComparer.OrdinalIgnoreCase)
 {
     ReadShaderMaps = true
 };
@@ -457,7 +457,7 @@ for (var i = 0; i < pkg.ExportMapLength; i++)
     {
         if (resource.LoadedShaderMapLegacy is not { } smFull) continue;
         var allShaders = smFull.Shaders.Concat(smFull.MeshShaderMaps.SelectMany(m => m.Shaders));
-        var target = allShaders.FirstOrDefault(s => s.TypeName == "TBasePassPSFNoLightMapPolicy" && s.Resource?.Code is { Length: > 0 });
+        var target = allShaders.FirstOrDefault(s => s.TypeName != null && s.TypeName.StartsWith("TBasePassPS") && s.Resource?.Code is { Length: > 0 });
         if (target == null) continue;
         Console.WriteLine($"=== Quality={smFull.ShaderMapId.QualityLevel} FeatureLevel={smFull.ShaderMapId.FeatureLevel} FULL DISASM ===");
         Console.WriteLine(MaterialPixelShaderAnalyzer.DisassembleLegacyShader(target, target.Resource.Code, smFull.MaterialCompilationOutput.UniformExpressionSet));

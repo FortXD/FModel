@@ -206,6 +206,14 @@ public static class PixelShaderDecompiler
         // 4-target GBuffer) can make the sink-detection heuristic in MapSinksToPins come up empty for
         // a pin that BuildPinExpressions still resolved correctly. Iterate the union of every source
         // that names a pin so one detector's gap doesn't silently hide the other's result.
+        // Forward/translucent permutations write no GBuffer, so Base Color never reaches a render
+        // target and pin recovery cannot see it. It IS present in the bytecode: the base pass applies
+        // View.DiffuseOverrideParameter to GBuffer.DiffuseColor (BasePassPixelShader.usf, the
+        // USE_DEVELOPMENT_SHADERS block), and that mad's first operand is DiffuseColor =
+        // BaseColor * (1 - Metallic). Recover it as a pin so a connected Base Color is not silently
+        // reported as absent.
+        RecoverDiffuseColorPin(wiring, ctx);
+
         var orderedPins = wiring.PinSources.Keys
             .Concat(wiring.PinExpressions.Keys)
             .Concat(wiring.PinDisassembly.Keys)
@@ -268,6 +276,30 @@ public static class PixelShaderDecompiler
                     .Append(string.Join(", ", wiring.PinSources[pin].Select(s => DescribeSource(s, ctx))))
                     .AppendLine();
             }
+        }
+
+        // Pins the analyzer never produced. Reporting them explicitly matters: silence here reads
+        // as "not connected in the material", which is a different and often wrong claim. Pin
+        // recovery is seeded from render-target writes, so a forward/translucent permutation only
+        // surfaces the targets it writes - a connected Base Color consumed inline by the forward
+        // lighting leaves no trace in the pin list.
+        string[] standardPins =
+        [
+            "Base Color", "Metallic", "Specular", "Roughness", "Emissive Color",
+            "Opacity", "Opacity Mask", "Normal", "Ambient Occlusion"
+        ];
+        var missingPins = standardPins.Where(sp => !orderedPins.Contains(sp)).ToList();
+        if (missingPins.Count > 0)
+        {
+            sb.AppendLine();
+            sb.Append("// Not recovered: ").Append(string.Join(", ", missingPins)).AppendLine();
+            sb.Append("//   ").Append(wiring.UsesGBuffer == false
+                    ? "this permutation writes no GBuffer (forward/translucent), so only the render targets it "
+                      + "actually writes are recoverable. A pin listed here may still be connected in the material "
+                      + "and consumed inline - Base Color, for example, feeds the forward lighting directly."
+                    : "no write to the corresponding render-target component was found in this permutation.")
+                .AppendLine();
+            sb.Append("//   Absence from this decompile is NOT evidence that the input is unconnected.").AppendLine();
         }
 
         return sb.ToString();
@@ -509,7 +541,66 @@ public static class PixelShaderDecompiler
         else name = $"_{ctx.NextId++}";
         ctx.UsedNames.Add(name);
         ctx.Names[node] = name; // set before printing the body in case a node ever referenced itself
-        ctx.Declarations.Add($"var {name} = {PrintNodeBody(node, ctx)};");
+        ctx.Declarations.Add($"var {name} = {PrintNodeBody(node, ctx)};{LaneNote(node)}");
+    }
+
+    /// <summary>
+    /// Finds `mad(DiffuseColor, View.DiffuseOverrideParameter.w, View.DiffuseOverrideParameter.xyz)`
+    /// anywhere in an already-recovered pin's DAG and exposes its first operand as the Base Color
+    /// pin. The override row is looked up by NAME in the engine layout table, not hardcoded, because
+    /// its row index differs between engine versions (130 on 4.2x, 126 on the UE4.19 table).
+    /// </summary>
+    private static void RecoverDiffuseColorPin(PixelShaderWiring wiring, PrintCtx ctx)
+    {
+        if (wiring.PinExpressions.ContainsKey("Base Color")) return;
+        var isUE4_19 = ctx.LegacyProfile == ELegacyShaderMapProfile.UE4_19;
+        var table = isUE4_19 ? EngineUniformBufferLayout.ViewRowsUE4_19 : EngineUniformBufferLayout.ViewRows;
+        var overrideRows = table.Where(kv => kv.Value.All(c => c == "DiffuseOverrideParameter"))
+            .Select(kv => kv.Key).ToHashSet();
+        if (overrideRows.Count == 0) return;
+
+        bool IsOverrideRow(PixelExpressionNode? n)
+        {
+            if (n is not { Op: "cbrow" }) return false;
+            var m = EngineBufferCbPattern.Match(n.Detail);
+            return m.Success && m.Groups["buf"].Value == "FViewUniformShaderParameters"
+                   && overrideRows.Contains(int.Parse(m.Groups["row"].Value));
+        }
+
+        PixelExpressionNode? found = null;
+        var seen = new HashSet<PixelExpressionNode>(ReferenceEqualityComparer.Instance);
+        void Walk(PixelExpressionNode n)
+        {
+            if (found != null || !seen.Add(n)) return;
+            if (n.Op == "mad" && n.Args.Count == 3
+                && IsOverrideRow(n.Args[1].Node) && IsOverrideRow(n.Args[2].Node)
+                && n.Args[0].Node != null)
+            {
+                found = n.Args[0].Node;
+                return;
+            }
+            foreach (var a in n.Args)
+                if (a.Node != null) Walk(a.Node);
+        }
+        foreach (var root in wiring.PinExpressions.Values.ToList()) Walk(root);
+        if (found != null) wiring.PinExpressions["Base Color"] = found;
+    }
+
+    /// <summary>
+    /// Notes a non-natural destination mask. Without this a reader sees `(-_15.xy + ...)` used
+    /// later as `_19.w` and reasonably assumes lane w came from source lane w; it did not, it
+    /// came from source component y. The k-th written lane maps to the k-th source component.
+    /// </summary>
+    private static string LaneNote(PixelExpressionNode node)
+    {
+        var lanes = node.Lanes;
+        if (lanes == null || lanes.Length == 0 || node.ChannelMap != null) return string.Empty;
+        var natural = true;
+        for (var i = 0; i < lanes.Length; i++)
+            if (lanes[i] != i) { natural = false; break; }
+        if (natural) return string.Empty;
+        return $"  // writes lanes .{string.Concat(lanes.Select(l => "xyzw"[Math.Clamp(l, 0, 3)]))}" +
+               " - k-th lane = k-th source component";
     }
 
     /// <summary>Resolves the same (Slot, Index) -> array lookup DescribeTexture uses, but returns just the bare identifier for naming.</summary>

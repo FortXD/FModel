@@ -17,6 +17,7 @@
     <Compile Include="..\FModel\ViewModels\MaterialPixelShaderAnalyzer.cs" Link="Ported\MaterialPixelShaderAnalyzer.cs" />
     <Compile Include="..\FModel\ViewModels\MaterialDxil.cs" Link="Ported\MaterialDxil.cs" />
     <Compile Include="..\FModel\ViewModels\PixelShaderDecompiler.cs" Link="Ported\PixelShaderDecompiler.cs" />
+    <Compile Include="..\FModel\ViewModels\MaterialShaderLibrary.cs" Link="Ported\MaterialShaderLibrary.cs" />
   </ItemGroup>
 
 </Project>
